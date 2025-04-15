@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Your BlazeCoin Wallet</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- QRCode.js for generating QR codes -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h2>Welcome, {{ username }}!</h2>
+    <p><a href="{{ url_for('login') }}">Log Out</a></p>
+    <hr>
+    <h3>Wallet Generator</h3>
+    <p class="warning">
+      WARNING: Losing your passphrase means losing access to your wallet! Please back up your wallet file securely.
+    </p>
+    <label for="passphraseGen">Enter a passphrase to secure your wallet:</label>
+    <input type="password" id="passphraseGen" placeholder="Your secret passphrase">
+    <div class="meter" id="passStrength">Passphrase strength: -</div>
+    <button id="generateWalletBtn">Generate New Wallet</button>
+    <h4>Wallet JSON (Public Key, Salt, IV, Encrypted Private Key):</h4>
+    <pre id="walletOutput">--</pre>
+    <button id="downloadWalletBtn" style="display:none;">Download Wallet File</button>
+    <div id="qrcode" style="display:none;"></div>
+    <hr>
+    <h3>Import Wallet</h3>
+    <label for="walletFileInput">Paste Wallet JSON:</label>
+    <textarea id="walletFileInput" rows="8" placeholder='{"publicKey":{...}, "salt": "...", "iv": "...", "encryptedPrivateKey": "..."}'></textarea>
+    <label for="passphraseImport">Enter your passphrase:</label>
+    <input type="password" id="passphraseImport" placeholder="Your secret passphrase">
+    <button id="importWalletBtn">Import Wallet</button>
+    <h4>Decrypted Private Key (JWK):</h4>
+    <pre id="decryptedKey">--</pre>
+    <hr>
+    <h3>Sign Transaction</h3>
+    <label for="transactionData">Transaction Data:</label>
+    <textarea id="transactionData" rows="4" placeholder="Enter transaction details here..."></textarea>
+    <button id="signTxBtn">Sign Transaction</button>
+    <h4>Signature (in hex):</h4>
+    <pre id="txSignature">--</pre>
+  </div>
+
+  <script>
+    // --- Utility Functions ---
+    function arrayBufferToHex(buffer) {
+      const byteArray = new Uint8Array(buffer);
+      return Array.from(byteArray).map(b => ('00' + b.toString(16)).slice(-2)).join('');
+    }
+    function hexToArrayBuffer(hex) {
+      const length = Math.ceil(hex.length / 2);
+      const arr = new Uint8Array(length);
+      for (let i = 0; i < length; i++) {
+        arr[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      return arr.buffer;
+    }
+
+    // --- Passphrase Strength Meter ---
+    const passInput = document.getElementById("passphraseGen");
+    const passStrengthEl = document.getElementById("passStrength");
+    passInput.addEventListener("input", function() {
+      const val = passInput.value;
+      let strength = "Weak";
+      if (val.length >= 12 && /[A-Z]/.test(val) && /[0-9]/.test(val) && /[^A-Za-z0-9]/.test(val)) {
+        strength = "Strong";
+      } else if (val.length >= 8) {
+        strength = "Medium";
+      }
+      passStrengthEl.textContent = "Passphrase strength: " + strength;
+    });
+
+    let decryptedPrivateKeyJWK = null;
+    async function generateWallet() {
+      const keyPair = await window.crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: "P-256" },
+        true,
+        ["sign", "verify"]
+      );
+      const publicKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
+      const privateKeyJWK = await window.crypto.subtle.exportKey("jwk", keyPair.privateKey);
+
+      const salt = window.crypto.getRandomValues(new Uint8Array(16));
+      const saltHex = arrayBufferToHex(salt.buffer);
+
+      const passphrase = passInput.value;
+      if (!passphrase) { alert("Please enter a passphrase."); return; }
+      const encoder = new TextEncoder();
+      const passData = encoder.encode(passphrase);
+      const baseKey = await window.crypto.subtle.importKey("raw", passData, { name: "PBKDF2" }, false, ["deriveKey"]);
+      const aesKey = await window.crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+      );
+
+      const privateKeyStr = JSON.stringify(privateKeyJWK);
+      const iv = window.crypto.getRandomValues(new Uint8Array(12));
+      const ivHex = arrayBufferToHex(iv.buffer);
+      const encryptedBuffer = await window.crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: iv },
+        aesKey,
+        encoder.encode(privateKeyStr)
+      );
+      const encryptedHex = arrayBufferToHex(encryptedBuffer);
+
+      const walletData = { publicKey: publicKeyJWK, salt: saltHex, iv: ivHex, encryptedPrivateKey: encryptedHex };
+
+      document.getElementById("walletOutput").textContent = JSON.stringify(walletData, null, 2);
+      document.getElementById("downloadWalletBtn").style.display = "inline-block";
+      document.getElementById("qrcode").style.display = "block";
+      document.getElementById("qrcode").innerHTML = "";
+      new QRCode(document.getElementById("qrcode"), { text: JSON.stringify(publicKeyJWK), width: 128, height: 128 });
+      
+      // Save wallet data to localStorage for this user (simulate account storage)
+      localStorage.setItem("blazecoin_" + "{{ username }}", JSON.stringify(walletData));
+    }
+
+    async function importWallet() {
+      const walletJSON = document.getElementById("walletFileInput").value;
+      const passphrase = document.getElementById("passphraseImport").value;
+      if (!walletJSON || !passphrase) {
+        alert("Please provide both your wallet JSON and passphrase.");
+        return;
+      }
+      let walletData;
+      try {
+        walletData = JSON.parse(walletJSON);
+      } catch (e) { alert("Invalid JSON format."); return; }
+      const encoder = new TextEncoder();
+      const passData = encoder.encode(passphrase);
+      const saltBuffer = hexToArrayBuffer(walletData.salt);
+      const baseKey = await window.crypto.subtle.importKey("raw", passData, {name:"PBKDF2"}, false, ["deriveKey"]);
+      const aesKey = await window.crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: new Uint8Array(saltBuffer), iterations: 100000, hash: "SHA-256" },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+      );
+      const ivBuffer = hexToArrayBuffer(walletData.iv);
+      const encryptedBuffer = hexToArrayBuffer(walletData.encryptedPrivateKey);
+      try {
+        const decryptedBuffer = await window.crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: new Uint8Array(ivBuffer) },
+          aesKey,
+          encryptedBuffer
+        );
+        const decoder = new TextDecoder();
+        const decryptedText = decoder.decode(decryptedBuffer);
+        document.getElementById("decryptedKey").textContent = decryptedText;
+        decryptedPrivateKeyJWK = JSON.parse(decryptedText);
+      } catch (e) {
+        alert("Decryption failed. Check your passphrase and wallet file.");
+      }
+    }
+
+    async function signTransaction() {
+      const txData = document.getElementById("transactionData").value;
+      if (!txData) { alert("Please enter transaction data to sign."); return; }
+      if (!decryptedPrivateKeyJWK) { alert("Please import your wallet first."); return; }
+      try {
+        const privateKey = await window.crypto.subtle.importKey(
+          "jwk",
+          decryptedPrivateKeyJWK,
+          { name: "ECDSA", namedCurve: "P-256" },
+          false,
+          ["sign"]
+        );
+        const encoder = new TextEncoder();
+        const txBuffer = encoder.encode(txData);
+        const signatureBuffer = await window.crypto.subtle.sign(
+          { name: "ECDSA", hash: { name: "SHA-256" } },
+          privateKey,
+          txBuffer
+        );
+        const signatureHex = arrayBufferToHex(signatureBuffer);
+        document.getElementById("txSignature").textContent = signatureHex;
+      } catch (e) {
+        alert("Transaction signing failed: " + e);
+      }
+    }
+
+    // --- Navigation & Simple Authentication (simulate using localStorage) ---
+    const authContainer = document.getElementById("auth-container");
+    const walletContainer = document.getElementById("wallet-container");
+
+    // Show sign up and sign in forms
+    const signInTabBtn = document.getElementById("signInTabBtn");
+    const signUpTabBtn = document.getElementById("signUpTabBtn");
+    const signInSection = document.getElementById("signInSection");
+    const signUpSection = document.getElementById("signUpSection");
+    
+    signInTabBtn.addEventListener("click", () => {
+      signInSection.style.display = "block";
+      signUpSection.style.display = "none";
+    });
+    signUpTabBtn.addEventListener("click", () => {
+      signUpSection.style.display = "block";
+      signInSection.style.display = "none";
+    });
+
+    const signUpForm = document.getElementById("signUpForm");
+    const signInForm = document.getElementById("signInForm");
+    const signUpMessage = document.getElementById("signUpMessage");
+    const signInMessage = document.getElementById("signInMessage");
+
+    if (signUpForm) {
+      signUpForm.addEventListener("submit", function(e) {
+        e.preventDefault();
+        const user = document.getElementById("signup-username").value;
+        const pass = document.getElementById("signup-pass").value;
+        if (!user || !pass) {
+          signUpMessage.textContent = "Please fill in both username and passphrase.";
+          return;
+        }
+        if (localStorage.getItem("blazecoin_" + user)) {
+          signUpMessage.textContent = "Username already registered. Try signing in.";
+          return;
+        }
+        signUpMessage.textContent = "Registered! Now generate your wallet.";
+        authContainer.style.display = "none";
+        walletContainer.style.display = "block";
+      });
+    }
+    
+    if (signInForm) {
+      signInForm.addEventListener("submit", function(e) {
+        e.preventDefault();
+        const user = document.getElementById("signin-username").value;
+        const pass = document.getElementById("signin-pass").value;
+        if (!user || !pass) {
+          signInMessage.textContent = "Please fill in both username and passphrase.";
+          return;
+        }
+        const storedWallet = localStorage.getItem("blazecoin_" + user);
+        if (!storedWallet) {
+          signInMessage.textContent = "User not found. Please sign up first.";
+          return;
+        }
+        signInMessage.textContent = "User found. Please import your wallet.";
+        authContainer.style.display = "none";
+        walletContainer.style.display = "block";
+        document.getElementById("walletFileInput").value = storedWallet;
+      });
+    }
+    
+    document.getElementById("logoutBtn").addEventListener("click", function() {
+      walletContainer.style.display = "none";
+      authContainer.style.display = "block";
+      document.getElementById("walletOutput").textContent = "--";
+      document.getElementById("decryptedKey").textContent = "--";
+      document.getElementById("txSignature").textContent = "--";
+      document.getElementById("qrcode").style.display = "none";
+    });
+
+    // --- Button Event Listeners ---
+    document.getElementById("createWalletBtn").addEventListener("click", generateWallet);
+    document.getElementById("doImportWalletBtn").addEventListener("click", importWallet);
+    document.getElementById("signTxBtn").addEventListener("click", signTransaction);
+  </script>
+</body>
+</html>
